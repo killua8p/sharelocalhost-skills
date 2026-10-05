@@ -1,0 +1,15 @@
+{
+  "name": "sharelocalhost-skills",
+  "description": "Agent skill for publishing HTML pages to a public URL with ShareLocalHost.",
+  "owner": {
+    "name": "killua8p",
+    "url": "https://github.com/killua8p/sharelocalhost-skills"
+  },
+  "plugins": [
+    {
+      "name": "sharelocalhost",
+      "description": "Publish self-contained HTML to a public, shareable URL via ShareLocalHost (slh-publish wrapper + one-curl API).",
+      "source": "./"
+    }
+  ]
+}

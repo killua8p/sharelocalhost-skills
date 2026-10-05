@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# slh-publish — publish (or update) an HTML file to ShareLocalHost.
+#
+# Usage:
+#   slh-publish <file.html> [--password PW] [--slug SLUG] [--ttl 7d]
+#                           [--assets inline|remote] [--update PAGE_ID]
+#
+# Reads the API key from $SLH_KEY (see ~/.config/sharelocalhost/env). The
+# endpoint defaults to https://sharelocal.host; override with $SLH_API.
+#
+# This is the allowlistable publish command: add `Bash(slh-publish:*)` to a
+# project's .claude/settings.json to let an agent publish without the per-call
+# exfiltration prompt — a narrow, legible pre-authorization of exactly this one
+# external destination (unlike allowlisting raw curl).
+set -euo pipefail
+
+api="${SLH_API:-https://sharelocal.host}"
+die() { echo "slh-publish: $*" >&2; exit 1; }
+
+[ -n "${SLH_KEY:-}" ] || die 'SLH_KEY is not set. Put your key in ~/.config/sharelocalhost/env (see the ShareLocalHost README).'
+
+file=""
+password=""
+update_id=""
+query=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --password) password="${2:-}"; shift 2 ;;
+    --slug)     query+=("slug=${2:-}"); shift 2 ;;
+    --ttl)      query+=("ttl=${2:-}"); shift 2 ;;
+    --assets)   query+=("assets=${2:-}"); shift 2 ;;
+    --update)   update_id="${2:-}"; shift 2 ;;
+    -h|--help)  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)         die "unknown flag: $1" ;;
+    *)          if [ -z "$file" ]; then file="$1"; else die "unexpected argument: $1"; fi; shift ;;
+  esac
+done
+
+[ -n "$file" ] || die 'usage: slh-publish <file.html> [--password PW] [--slug S] [--ttl T] [--assets inline|remote] [--update PAGE_ID]'
+[ -f "$file" ] || die "no such file: $file"
+
+qs=""
+if [ "${#query[@]}" -gt 0 ]; then
+  qs="?$(IFS='&'; echo "${query[*]}")"
+fi
+
+args=(-sS -w '\n%{http_code}' -H "Authorization: Bearer $SLH_KEY" -H "Content-Type: text/html")
+[ -n "$password" ] && args+=(-H "X-Page-Password: $password")
+if [ -n "$update_id" ]; then
+  args+=(-X PUT "$api/v1/pages/$update_id$qs")
+else
+  args+=("$api/v1/pages$qs")
+fi
+args+=(--data-binary "@$file")
+
+resp="$(curl "${args[@]}")"
+code="${resp##*$'\n'}"
+body="${resp%$'\n'*}"
+
+if command -v jq >/dev/null 2>&1; then
+  if [ "$code" = "200" ] || [ "$code" = "201" ]; then
+    echo "$body" | jq -r '"Published: \(.url)" + (if .fresh_url then "\nFresh:     \(.fresh_url)" else "" end) + "\npage_id:   \(.page_id)\ntoken:     \(.page_token)" + (if .protected then "\n🔒 password-protected" else "" end)'
+  else
+    { echo "Error (HTTP $code):"; echo "$body" | jq -r '.error | "  \(.code): \(.message)\n  hint: \(.hint)"'; } >&2
+    exit 1
+  fi
+else
+  echo "$body"
+  case "$code" in 200|201) ;; *) exit 1 ;; esac
+fi
