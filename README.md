@@ -7,9 +7,11 @@ back a public URL to hand to a human.
 This repo is a Claude Code plugin marketplace and an `npx skills`-compatible
 skills repo. It contains only what an agent needs to install:
 
-- `skills/sharelocalhost/SKILL.md` — when and how to publish, update, protect
-  and expire pages; defers to the live contract at `curl https://sharelocal.host/`.
-- `bin/slh-publish` — the allowlistable publish wrapper (`Bash(slh-publish:*)`).
+- `skills/sharelocalhost/SKILL.md` — first-run setup via claim code, then when
+  and how to publish, update, protect and expire pages; defers to the live
+  contract at `curl https://sharelocal.host/`.
+- `bin/slh-publish` — the allowlistable wrapper (`Bash(slh-publish:*)`):
+  `login`, `doctor`, publish/update.
 - `.claude-plugin/` — marketplace and plugin manifests.
 
 ## Install
@@ -33,21 +35,26 @@ npx skills add killua8p/sharelocalhost-skills --skill sharelocalhost
 
 ## You still need a key
 
-Keys are issued by hand; there is no sign-up. Ask support@sharelocal.host.
-Store it where your agent's non-interactive shell can see it:
+Keys are issued by hand; there is no sign-up. Ask support@sharelocal.host for a
+one-time **claim code** (`slh_claim_...`). It is single-use and short-lived, so
+it is safe to paste into a chat. Give it to your agent, or run:
 
 ```sh
-mkdir -p ~/.config/sharelocalhost && chmod 700 ~/.config/sharelocalhost
-printf 'export SLH_KEY=%s\n' 'slh_live_...' > ~/.config/sharelocalhost/env
-chmod 600 ~/.config/sharelocalhost/env
-echo '[ -f ~/.config/sharelocalhost/env ] && source ~/.config/sharelocalhost/env' >> ~/.zshenv
+slh-publish login slh_claim_...
 ```
+
+That exchanges the code for a key and stores it at
+`~/.config/sharelocalhost/key` (mode 600). No shell configuration is needed:
+the wrapper reads that file directly (`$SLH_KEY`, if set, still wins).
+`slh-publish doctor` tells you whether everything works.
 
 ## Wrapper
 
-`bin/slh-publish` reads `$SLH_KEY`, prints the URL, `page_id` and `page_token`,
-and surfaces the server's error `hint`. Put it on your PATH, or use the copy a
-Claude Code plugin install ships at `${CLAUDE_PLUGIN_ROOT}/bin/slh-publish`.
+`bin/slh-publish` has three jobs: `login <claim-code>`, `doctor`, and
+publishing. It prints the URL, `page_id` and `page_token`, and surfaces the
+server's error `hint`. Put it on your PATH, or use the copy a Claude Code
+plugin install ships at `${CLAUDE_PLUGIN_ROOT}/bin/slh-publish`; the skill
+also knows how to fetch it from this repo if neither is present.
 
 ```sh
 slh-publish report.html --password 0303 --slug q3-report --ttl 30d

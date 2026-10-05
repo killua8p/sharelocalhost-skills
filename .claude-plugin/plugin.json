@@ -1,6 +1,6 @@
 {
   "name": "sharelocalhost",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Agent skill for publishing HTML pages to a public URL with ShareLocalHost.",
   "author": {
     "name": "killua8p",

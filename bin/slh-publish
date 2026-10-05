@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# slh-publish — publish (or update) an HTML file to ShareLocalHost.
+# slh-publish — publish HTML to ShareLocalHost, and manage the key that lets you.
 #
 # Usage:
+#   slh-publish login <claim-code>     exchange a one-time claim code for a key and store it
+#   slh-publish doctor                 check key + connectivity; explain what is wrong
 #   slh-publish <file.html> [--password PW] [--slug SLUG] [--ttl 7d]
 #                           [--assets inline|remote] [--update PAGE_ID]
 #
-# Reads the API key from $SLH_KEY (see ~/.config/sharelocalhost/env). The
-# endpoint defaults to https://sharelocal.host; override with $SLH_API.
+# Key lookup order: $SLH_KEY, then $SLH_CONFIG_DIR/key (default
+# ~/.config/sharelocalhost/key), then the legacy $SLH_CONFIG_DIR/env file.
+# No shell configuration is needed. Endpoint: $SLH_API (default
+# https://sharelocal.host).
 #
 # This is the allowlistable publish command: add `Bash(slh-publish:*)` to a
 # project's .claude/settings.json to let an agent publish without the per-call
@@ -15,9 +19,99 @@
 set -euo pipefail
 
 api="${SLH_API:-https://sharelocal.host}"
+cfg="${SLH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/sharelocalhost}"
 die() { echo "slh-publish: $*" >&2; exit 1; }
+have_jq() { command -v jq >/dev/null 2>&1; }
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
 
-[ -n "${SLH_KEY:-}" ] || die 'SLH_KEY is not set. Put your key in ~/.config/sharelocalhost/env (see the ShareLocalHost README).'
+# Where the key came from: env | file | legacy | none
+key_source="none"
+load_key() {
+  if [ -n "${SLH_KEY:-}" ]; then key_source="env"; return 0; fi
+  if [ -f "$cfg/key" ]; then
+    SLH_KEY="$(tr -d '[:space:]' < "$cfg/key")"
+    [ -n "$SLH_KEY" ] && { key_source="file"; return 0; }
+  fi
+  if [ -f "$cfg/env" ]; then
+    # shellcheck disable=SC1090
+    . "$cfg/env"
+    [ -n "${SLH_KEY:-}" ] && { key_source="legacy"; return 0; }
+  fi
+  return 1
+}
+
+# Minimal JSON field extraction when jq is absent (the API pretty-prints one
+# field per line, so this is reliable for the flat fields we read).
+field() { # field <name> <json>
+  if have_jq; then printf '%s' "$2" | jq -r --arg k "$1" '.[$k] // empty'
+  else printf '%s' "$2" | sed -n "s/.*\"$1\": *\"\([^\"]*\)\".*/\1/p" | head -1; fi
+}
+err_text() { # err_text <json>
+  if have_jq; then printf '%s' "$1" | jq -r '.error | "  \(.code): \(.message)\n  hint: \(.hint)"'
+  else printf '%s\n' "$1"; fi
+}
+
+cmd_login() {
+  local code="${1:-}"
+  [ -n "$code" ] || die 'usage: slh-publish login <claim-code>   (codes look like slh_claim_...; ask the operator for one)'
+  case "$code" in slh_live_*) die 'that is an API key, not a claim code. To use it directly: export SLH_KEY=<key>, or write it to '"$cfg/key" ;; esac
+  local payload resp http body
+  if have_jq; then payload="$(jq -cn --arg c "$code" '{code:$c}')"; else payload="{\"code\":\"$code\"}"; fi
+  resp="$(curl -sS -w '\n%{http_code}' -H 'Content-Type: application/json' --data "$payload" "$api/v1/claim")"
+  http="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+  if [ "$http" != "201" ]; then
+    { echo "Login failed (HTTP $http):"; err_text "$body"; } >&2
+    exit 1
+  fi
+  local key name kid
+  key="$(field api_key "$body")"; name="$(field name "$body")"; kid="$(field key_id "$body")"
+  [ -n "$key" ] || die 'unexpected response from the server (no api_key).'
+  ( umask 077; mkdir -p "$cfg"; printf '%s\n' "$key" > "$cfg/key" )
+  chmod 600 "$cfg/key"
+  echo "Logged in as \"$name\" ($kid). Key stored at $cfg/key (mode 600)."
+  echo "Next: slh-publish doctor   # or just publish: slh-publish page.html"
+}
+
+cmd_doctor() {
+  local ok=0
+  echo "endpoint:  $api"
+  if ! command -v curl >/dev/null 2>&1; then echo "curl:      MISSING (required)"; exit 1; fi
+  if have_jq; then echo "jq:        ok"; else echo "jq:        missing (optional; output will be raw JSON)"; fi
+  if load_key; then
+    case "$key_source" in
+      env)    echo "key:       from \$SLH_KEY" ;;
+      file)   echo "key:       from $cfg/key" ;;
+      legacy) echo "key:       from $cfg/env (legacy; 'slh-publish login' writes $cfg/key instead)" ;;
+    esac
+    case "$SLH_KEY" in slh_live_*) ;; *) echo "           WARNING: key does not start with slh_live_" ;; esac
+    local resp http body
+    resp="$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $SLH_KEY" "$api/v1/pages")"
+    http="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+    if [ "$http" = "200" ]; then
+      local n="?"; have_jq && n="$(printf '%s' "$body" | jq '.pages | length')"
+      echo "auth:      ok ($n page(s) on this key)"
+    else
+      ok=1; echo "auth:      FAILED (HTTP $http)"; err_text "$body" | sed 's/^/           /'
+      [ "$http" = "401" ] && echo "           Fix: get a new claim code from the operator and run: slh-publish login <code>"
+    fi
+  else
+    ok=1
+    echo "key:       NOT FOUND"
+    echo "           Ask the operator for a one-time claim code (slh_claim_...), then run:"
+    echo "             slh-publish login <code>"
+    echo "           It stores the key at $cfg/key; no shell configuration needed."
+  fi
+  exit $ok
+}
+
+case "${1:-}" in
+  login)      shift; cmd_login "$@"; exit 0 ;;
+  doctor)     cmd_doctor ;;
+  -h|--help)  usage; exit 0 ;;
+  "")         die "$(usage)" ;;
+esac
+
+load_key || die "no key found. Ask the operator for a claim code and run: slh-publish login <code>   (or export SLH_KEY). Run 'slh-publish doctor' for details."
 
 file=""
 password=""
@@ -31,7 +125,6 @@ while [ $# -gt 0 ]; do
     --ttl)      query+=("ttl=${2:-}"); shift 2 ;;
     --assets)   query+=("assets=${2:-}"); shift 2 ;;
     --update)   update_id="${2:-}"; shift 2 ;;
-    -h|--help)  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)         die "unknown flag: $1" ;;
     *)          if [ -z "$file" ]; then file="$1"; else die "unexpected argument: $1"; fi; shift ;;
   esac
@@ -58,11 +151,11 @@ resp="$(curl "${args[@]}")"
 code="${resp##*$'\n'}"
 body="${resp%$'\n'*}"
 
-if command -v jq >/dev/null 2>&1; then
+if have_jq; then
   if [ "$code" = "200" ] || [ "$code" = "201" ]; then
     echo "$body" | jq -r '"Published: \(.url)" + (if .fresh_url then "\nFresh:     \(.fresh_url)" else "" end) + "\npage_id:   \(.page_id)\ntoken:     \(.page_token)" + (if .protected then "\n🔒 password-protected" else "" end)'
   else
-    { echo "Error (HTTP $code):"; echo "$body" | jq -r '.error | "  \(.code): \(.message)\n  hint: \(.hint)"'; } >&2
+    { echo "Error (HTTP $code):"; err_text "$body"; } >&2
     exit 1
   fi
 else
