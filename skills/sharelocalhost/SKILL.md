@@ -15,7 +15,9 @@ description: >
 ShareLocalHost turns one HTML file into a public page at
 `https://<id>.local-8000.site/`. You hand the user the URL. You keep the
 `page_id` and a per-page `page_token` so you can update the page later or
-delegate it to a subagent. Everything goes through one command, `slh-publish`.
+delegate it to a subagent. Everything goes through one command, `slh-publish`,
+which covers the whole API: `slh-publish --help` lists every subcommand and
+option, so you never need to read the API document.
 
 ## 1. Find the wrapper
 
@@ -92,7 +94,29 @@ $SLH report.html --update <page_id>
 The output includes `Fresh: <url>?v=...`, a cache-busting variant that shows
 the new content immediately; share that if the user will look right away.
 
-## 5. Errors
+## 5. Everything else the API offers
+
+All through the same wrapper; add `--json` to any of these for the raw API
+response.
+
+```bash
+$SLH list                         # every page on this key (100 per call; prints a --cursor for more)
+$SLH get <page_id>                # metadata: version, size, sha256, expiry, protected, token
+$SLH content <page_id> -o f.html  # read back the stored HTML (or omit -o to print it)
+$SLH delete <page_id>             # the URL then serves 410 forever; ids are never reused
+$SLH publish f.html --idempotency-key task-42     # a retried create returns the same page
+$SLH update <id> f.html --if-match <sha256>       # 412 if someone changed it since you read it
+$SLH update <id> f.html --no-password             # remove protection; --password sets/replaces it
+$SLH update <id> f.html --ttl 7d --assets remote  # change expiry or the network policy
+$SLH get <id> --token pt_...      # any per-page command can use a page token instead of the key
+```
+
+Use `--idempotency-key` whenever a publish might be retried (flaky network,
+re-run task). Use `get` before `update --if-match` when another agent may be
+editing the same page. When a subagent should manage one page, give it the
+page's token and have it pass `--token`; never give it the account key.
+
+## 6. Errors
 
 Every failure prints `code: message` and a `hint`. Read the hint, fix the
 request, retry once. Common: `too_large` (compress or drop inlined assets),

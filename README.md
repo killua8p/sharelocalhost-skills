@@ -10,8 +10,9 @@ skills repo. It contains only what an agent needs to install:
 - `skills/sharelocalhost/SKILL.md` — first-run setup via claim code, then when
   and how to publish, update, protect and expire pages; defers to the live
   contract at `curl https://sharelocal.host/`.
-- `bin/slh-publish` — the allowlistable wrapper (`Bash(slh-publish:*)`):
-  `login`, `doctor`, publish/update.
+- `bin/slh-publish` — the allowlistable wrapper (`Bash(slh-publish:*)`) and a
+  complete API client: `login`, `doctor`, publish, `update`, `list`, `get`,
+  `content`, `delete`.
 - `.claude-plugin/` — marketplace and plugin manifests.
 
 ## Install
@@ -50,19 +51,31 @@ the wrapper reads that file directly (`$SLH_KEY`, if set, still wins).
 
 ## Wrapper
 
-`bin/slh-publish` has three jobs: `login <claim-code>`, `doctor`, and
-publishing. It prints the URL, `page_id` and `page_token`, and surfaces the
-server's error `hint`. Put it on your PATH, or use the copy a Claude Code
-plugin install ships at `${CLAUDE_PLUGIN_ROOT}/bin/slh-publish`; the skill
-also knows how to fetch it from this repo if neither is present.
+`bin/slh-publish` is a complete client for the API; `slh-publish --help` lists
+everything. Put it on your PATH, or use the copy a Claude Code plugin install
+ships at `${CLAUDE_PLUGIN_ROOT}/bin/slh-publish` (Claude Code also puts plugin
+`bin` directories on the agent's PATH); the skill fetches it from this repo if
+neither is present.
 
 ```sh
+slh-publish login <claim-code>                 # one-time setup
+slh-publish doctor                             # key + connectivity check
+
 slh-publish report.html --password 0303 --slug q3-report --ttl 30d
-slh-publish report.html --update <page_id>      # re-publish to the same URL
+slh-publish update <page_id> report.html       # same URL, new content
+slh-publish list                               # your pages
+slh-publish get <page_id>                      # metadata
+slh-publish content <page_id> -o report.html   # read back the HTML
+slh-publish delete <page_id>                   # URL serves 410 forever
 ```
 
+Options: `--idempotency-key K` (safe retries), `--if-match SHA256` (conditional
+update), `--no-password` (remove protection), `--assets remote` (allow https:
+loads/fetch), `--token pt_...` (act with a page token), `--json` (raw response).
+
 To let Claude Code publish without a per-call exfiltration prompt, allow
-exactly this command in the project's `.claude/settings.json`:
+exactly this command in the project's `.claude/settings.json`, or pick "don't
+ask again" on the first prompt:
 
 ```json
 { "permissions": { "allow": ["Bash(slh-publish:*)"] } }

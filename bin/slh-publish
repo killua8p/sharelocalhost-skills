@@ -1,19 +1,41 @@
 #!/usr/bin/env bash
-# slh-publish — publish HTML to ShareLocalHost, and manage the key that lets you.
+# slh-publish — the ShareLocalHost client: publish HTML to a public URL, and
+# everything else the API offers, without consulting the API document.
 #
-# Usage:
-#   slh-publish login <claim-code>     exchange a one-time claim code for a key and store it
-#   slh-publish doctor                 check key + connectivity; explain what is wrong
-#   slh-publish <file.html> [--password PW] [--slug SLUG] [--ttl 7d]
-#                           [--assets inline|remote] [--update PAGE_ID]
+# Setup
+#   slh-publish login <claim-code>          exchange a one-time claim code for a key and store it
+#   slh-publish doctor                      check key + connectivity; explain what is wrong
+#
+# Pages
+#   slh-publish <file.html> [opts]          publish a new page (same as `publish`)
+#   slh-publish publish <file.html> [opts]
+#   slh-publish update <page_id> <file.html> [opts] [--if-match SHA256] [--no-password]
+#   slh-publish list [--cursor CURSOR]      your pages, 100 per call
+#   slh-publish get <page_id>               metadata (version, size, sha256, expiry, ...)
+#   slh-publish content <page_id> [-o FILE] read back the stored HTML
+#   slh-publish delete <page_id>            delete; the URL then serves 410 forever
+#
+# Publish/update options
+#   --password PW        HTTP Basic protection (visitors enter PW with any username)
+#   --no-password        update only: remove protection
+#   --slug SLUG          readable URL prefix, 3-30 chars of [a-z0-9-]
+#   --ttl 7d             auto-expire: 30m, 12h, 7d ... 365d, or never
+#   --assets inline|remote   remote = page may load https: scripts/images and use fetch
+#   --idempotency-key K  publish only: a retry with the same K returns the original page
+#   --if-match SHA256    update only: fail with 412 if the page changed since you read it
+#
+# Global options
+#   --token pt_...       authenticate with a page token instead of the account key
+#                        (update/get/content/delete on that one page only)
+#   --json               print the raw API response instead of a summary
 #
 # Key lookup order: $SLH_KEY, then $SLH_CONFIG_DIR/key (default
 # ~/.config/sharelocalhost/key), then the legacy $SLH_CONFIG_DIR/env file.
 # No shell configuration is needed. Endpoint: $SLH_API (default
 # https://sharelocal.host).
 #
-# This is the allowlistable publish command: add `Bash(slh-publish:*)` to a
-# project's .claude/settings.json to let an agent publish without the per-call
+# This is the allowlistable command: add `Bash(slh-publish:*)` to a project's
+# .claude/settings.json to let an agent publish without the per-call
 # exfiltration prompt — a narrow, legible pre-authorization of exactly this one
 # external destination (unlike allowlisting raw curl).
 set -euo pipefail
@@ -22,9 +44,9 @@ api="${SLH_API:-https://sharelocal.host}"
 cfg="${SLH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/sharelocalhost}"
 die() { echo "slh-publish: $*" >&2; exit 1; }
 have_jq() { command -v jq >/dev/null 2>&1; }
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; }
 
-# Where the key came from: env | file | legacy | none
+# ---------- credentials ----------
 key_source="none"
 load_key() {
   if [ -n "${SLH_KEY:-}" ]; then key_source="env"; return 0; fi
@@ -40,29 +62,90 @@ load_key() {
   return 1
 }
 
-# Minimal JSON field extraction when jq is absent (the API pretty-prints one
-# field per line, so this is reliable for the flat fields we read).
+# ---------- global flags (extracted before dispatch) ----------
+json_out=0
+token=""
+argv=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json)   json_out=1; shift ;;
+    --token)  token="${2:-}"; [ -n "$token" ] || die '--token needs a value (pt_...)'; shift 2 ;;
+    --token=*) token="${1#--token=}"; shift ;;
+    *)        argv+=("$1"); shift ;;
+  esac
+done
+set -- "${argv[@]+"${argv[@]}"}"
+
+cred() {
+  if [ -n "$token" ]; then printf '%s' "$token"; return; fi
+  load_key || die "no key found. Ask the operator for a claim code and run: slh-publish login <code>   (or export SLH_KEY). Run 'slh-publish doctor' for details."
+  printf '%s' "$SLH_KEY"
+}
+
+# ---------- JSON helpers ----------
+# Minimal field extraction when jq is absent (the API pretty-prints one field
+# per line, so this is reliable for the flat string fields we read).
 field() { # field <name> <json>
   if have_jq; then printf '%s' "$2" | jq -r --arg k "$1" '.[$k] // empty'
   else printf '%s' "$2" | sed -n "s/.*\"$1\": *\"\([^\"]*\)\".*/\1/p" | head -1; fi
 }
 err_text() { # err_text <json>
-  if have_jq; then printf '%s' "$1" | jq -r '.error | "  \(.code): \(.message)\n  hint: \(.hint)"'
+  if have_jq; then printf '%s' "$1" | jq -r '.error | "  \(.code): \(.message)\n  hint: \(.hint)" + (if .retry_after_seconds then "\n  retry_after_seconds: \(.retry_after_seconds)" else "" end) + (if .current_sha256 then "\n  current_sha256: \(.current_sha256)" else "" end)'
   else printf '%s\n' "$1"; fi
 }
 
+# ---------- HTTP ----------
+# request <METHOD> <path> [curl args...]  -> sets $http and $body; exits 1 on non-2xx
+http=""; body=""
+request() {
+  local method="$1" path="$2"; shift 2
+  local resp
+  resp="$(curl -sS -w '\n%{http_code}' -X "$method" "$@" "$api$path")"
+  http="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+  case "$http" in
+    2*) return 0 ;;
+    *)  { echo "Error (HTTP $http):"; err_text "$body"; } >&2; exit 1 ;;
+  esac
+}
+auth_header() { printf 'Authorization: Bearer %s' "$(cred)"; }
+
+# ---------- page option parsing (publish/update) ----------
+password=""; no_password=0; idem=""; if_match=""; query=(); positional=()
+parse_page_opts() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --password)         password="${2:-}"; shift 2 ;;
+      --no-password)      no_password=1; shift ;;
+      --slug)             query+=("slug=${2:-}"); shift 2 ;;
+      --ttl)              query+=("ttl=${2:-}"); shift 2 ;;
+      --assets)           query+=("assets=${2:-}"); shift 2 ;;
+      --idempotency-key)  idem="${2:-}"; shift 2 ;;
+      --if-match)         if_match="${2:-}"; shift 2 ;;
+      --update)           legacy_update="${2:-}"; shift 2 ;;   # legacy: <file> --update ID
+      -h|--help)          usage; exit 0 ;;
+      -*)                 die "unknown option: $1" ;;
+      *)                  positional+=("$1"); shift ;;
+    esac
+  done
+}
+qs() { if [ "${#query[@]}" -gt 0 ]; then printf '?%s' "$(IFS='&'; echo "${query[*]}")"; fi; }
+
+print_page() { # summary of a create/update response
+  if [ "$json_out" = 1 ] || ! have_jq; then echo "$body"; return; fi
+  echo "$body" | jq -r '"Published: \(.url)" + (if .fresh_url then "\nFresh:     \(.fresh_url)" else "" end) + "\npage_id:   \(.page_id)\ntoken:     \(.page_token)\nversion:   \(.version)  size: \(.size_bytes) bytes  sha256: \(.sha256[0:12])…" + (if .expires_at then "\nexpires:   \(.expires_at)" else "" end) + (if .protected then "\n🔒 password-protected" else "" end)'
+}
+
+# ---------- commands ----------
 cmd_login() {
   local code="${1:-}"
   [ -n "$code" ] || die 'usage: slh-publish login <claim-code>   (codes look like slh_claim_...; ask the operator for one)'
   case "$code" in slh_live_*) die 'that is an API key, not a claim code. To use it directly: export SLH_KEY=<key>, or write it to '"$cfg/key" ;; esac
-  local payload resp http body
+  local payload
   if have_jq; then payload="$(jq -cn --arg c "$code" '{code:$c}')"; else payload="{\"code\":\"$code\"}"; fi
+  local resp
   resp="$(curl -sS -w '\n%{http_code}' -H 'Content-Type: application/json' --data "$payload" "$api/v1/claim")"
   http="${resp##*$'\n'}"; body="${resp%$'\n'*}"
-  if [ "$http" != "201" ]; then
-    { echo "Login failed (HTTP $http):"; err_text "$body"; } >&2
-    exit 1
-  fi
+  if [ "$http" != "201" ]; then { echo "Login failed (HTTP $http):"; err_text "$body"; } >&2; exit 1; fi
   local key name kid
   key="$(field api_key "$body")"; name="$(field name "$body")"; kid="$(field key_id "$body")"
   [ -n "$key" ] || die 'unexpected response from the server (no api_key).'
@@ -84,7 +167,7 @@ cmd_doctor() {
       legacy) echo "key:       from $cfg/env (legacy; 'slh-publish login' writes $cfg/key instead)" ;;
     esac
     case "$SLH_KEY" in slh_live_*) ;; *) echo "           WARNING: key does not start with slh_live_" ;; esac
-    local resp http body
+    local resp
     resp="$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $SLH_KEY" "$api/v1/pages")"
     http="${resp##*$'\n'}"; body="${resp%$'\n'*}"
     if [ "$http" = "200" ]; then
@@ -104,61 +187,91 @@ cmd_doctor() {
   exit $ok
 }
 
-case "${1:-}" in
-  login)      shift; cmd_login "$@"; exit 0 ;;
-  doctor)     cmd_doctor ;;
-  -h|--help)  usage; exit 0 ;;
-  "")         die "$(usage)" ;;
-esac
+cmd_publish() { parse_page_opts "$@"; do_publish; }
+do_publish() {
+  [ "${#positional[@]}" -eq 1 ] || die 'usage: slh-publish publish <file.html> [--password PW] [--slug S] [--ttl T] [--assets inline|remote] [--idempotency-key K]'
+  local file="${positional[0]}"
+  [ -f "$file" ] || die "no such file: $file"
+  [ "$no_password" = 0 ] || die '--no-password only applies to update'
+  [ -z "$if_match" ] || die '--if-match only applies to update'
+  local args=(-H "$(auth_header)" -H "Content-Type: text/html")
+  [ -n "$password" ] && args+=(-H "X-Page-Password: $password")
+  [ -n "$idem" ] && args+=(-H "Idempotency-Key: $idem")
+  request POST "/v1/pages$(qs)" "${args[@]}" --data-binary "@$file"
+  print_page
+}
 
-load_key || die "no key found. Ask the operator for a claim code and run: slh-publish login <code>   (or export SLH_KEY). Run 'slh-publish doctor' for details."
+cmd_update() { parse_page_opts "$@"; do_update; }
+do_update() {
+  [ "${#positional[@]}" -eq 2 ] || die 'usage: slh-publish update <page_id> <file.html> [--password PW | --no-password] [--slug S] [--ttl T] [--assets inline|remote] [--if-match SHA256]'
+  local id="${positional[0]}" file="${positional[1]}"
+  [ -f "$file" ] || die "no such file: $file"
+  [ -z "$idem" ] || die '--idempotency-key only applies to publish'
+  local args=(-H "$(auth_header)" -H "Content-Type: text/html")
+  if [ "$no_password" = 1 ]; then args+=(-H "X-Page-Password;")
+  elif [ -n "$password" ]; then args+=(-H "X-Page-Password: $password"); fi
+  [ -n "$if_match" ] && args+=(-H "If-Match: \"${if_match#\"}\"")
+  request PUT "/v1/pages/$id$(qs)" "${args[@]}" --data-binary "@$file"
+  print_page
+}
 
-file=""
-password=""
-update_id=""
-query=()
+cmd_list() { # [--cursor C]
+  local cursor=""
+  while [ $# -gt 0 ]; do case "$1" in --cursor) cursor="${2:-}"; shift 2 ;; *) die "unknown option: $1" ;; esac; done
+  local path="/v1/pages"; [ -n "$cursor" ] && path="$path?cursor=$cursor"
+  request GET "$path" -H "$(auth_header)"
+  if [ "$json_out" = 1 ] || ! have_jq; then echo "$body"; return; fi
+  echo "$body" | jq -r '
+    if (.pages | length) == 0 then "No pages on this key." else
+    (.pages[] | "\(.page_id)  \(.url)" + (if .protected then "  🔒" else "" end) + (if .expires_at then "  expires \(.expires_at)" else "" end) + "  v\(.version) \(.size_bytes)B updated \(.updated_at)") end,
+    (if .cursor then "\nMore: slh-publish list --cursor \(.cursor)" else empty end)'
+}
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --password) password="${2:-}"; shift 2 ;;
-    --slug)     query+=("slug=${2:-}"); shift 2 ;;
-    --ttl)      query+=("ttl=${2:-}"); shift 2 ;;
-    --assets)   query+=("assets=${2:-}"); shift 2 ;;
-    --update)   update_id="${2:-}"; shift 2 ;;
-    -*)         die "unknown flag: $1" ;;
-    *)          if [ -z "$file" ]; then file="$1"; else die "unexpected argument: $1"; fi; shift ;;
-  esac
-done
+cmd_get() { # <page_id>
+  [ $# -eq 1 ] || die 'usage: slh-publish get <page_id>'
+  request GET "/v1/pages/$1" -H "$(auth_header)"
+  if [ "$json_out" = 1 ] || ! have_jq; then echo "$body"; return; fi
+  echo "$body" | jq -r '"url:       \(.url)\npage_id:   \(.page_id)\ntoken:     \(.page_token)\nversion:   \(.version)\nsize:      \(.size_bytes) bytes\nsha256:    \(.sha256)\nassets:    \(.assets)\nslug:      \(.slug // "-")\nprotected: \(.protected)\nexpires:   \(.expires_at // "never")\ncreated:   \(.created_at)\nupdated:   \(.updated_at)"'
+}
 
-[ -n "$file" ] || die 'usage: slh-publish <file.html> [--password PW] [--slug S] [--ttl T] [--assets inline|remote] [--update PAGE_ID]'
-[ -f "$file" ] || die "no such file: $file"
-
-qs=""
-if [ "${#query[@]}" -gt 0 ]; then
-  qs="?$(IFS='&'; echo "${query[*]}")"
-fi
-
-args=(-sS -w '\n%{http_code}' -H "Authorization: Bearer $SLH_KEY" -H "Content-Type: text/html")
-[ -n "$password" ] && args+=(-H "X-Page-Password: $password")
-if [ -n "$update_id" ]; then
-  args+=(-X PUT "$api/v1/pages/$update_id$qs")
-else
-  args+=("$api/v1/pages$qs")
-fi
-args+=(--data-binary "@$file")
-
-resp="$(curl "${args[@]}")"
-code="${resp##*$'\n'}"
-body="${resp%$'\n'*}"
-
-if have_jq; then
-  if [ "$code" = "200" ] || [ "$code" = "201" ]; then
-    echo "$body" | jq -r '"Published: \(.url)" + (if .fresh_url then "\nFresh:     \(.fresh_url)" else "" end) + "\npage_id:   \(.page_id)\ntoken:     \(.page_token)" + (if .protected then "\n🔒 password-protected" else "" end)'
+cmd_content() { # <page_id> [-o FILE]
+  local id="" out=""
+  while [ $# -gt 0 ]; do case "$1" in -o|--output) out="${2:-}"; shift 2 ;; -*) die "unknown option: $1" ;; *) id="$1"; shift ;; esac; done
+  [ -n "$id" ] || die 'usage: slh-publish content <page_id> [-o FILE]'
+  if [ -n "$out" ]; then
+    local code
+    code="$(curl -sS -w '%{http_code}' -o "$out" -H "$(auth_header)" "$api/v1/pages/$id/content")"
+    case "$code" in 2*) echo "Saved $(wc -c < "$out" | tr -d ' ') bytes to $out" ;; *) { echo "Error (HTTP $code):"; err_text "$(cat "$out")"; } >&2; rm -f "$out"; exit 1 ;; esac
   else
-    { echo "Error (HTTP $code):"; err_text "$body"; } >&2
-    exit 1
+    request GET "/v1/pages/$id/content" -H "$(auth_header)"
+    printf '%s\n' "$body"
   fi
-else
-  echo "$body"
-  case "$code" in 200|201) ;; *) exit 1 ;; esac
-fi
+}
+
+cmd_delete() { # <page_id>
+  [ $# -eq 1 ] || die 'usage: slh-publish delete <page_id>'
+  request DELETE "/v1/pages/$1" -H "$(auth_header)"
+  if [ "$json_out" = 1 ] || ! have_jq; then echo "$body"; return; fi
+  echo "Deleted $1. Its URL now serves 410 permanently; the id is never reused."
+}
+
+# ---------- dispatch ----------
+legacy_update=""
+case "${1:-}" in
+  login)      shift; cmd_login "$@" ;;
+  doctor)     cmd_doctor ;;
+  publish)    shift; cmd_publish "$@" ;;
+  update)     shift; cmd_update "$@" ;;
+  list)       shift; cmd_list "$@" ;;
+  get)        shift; cmd_get "$@" ;;
+  content)    shift; cmd_content "$@" ;;
+  delete|rm)  shift; cmd_delete "$@" ;;
+  -h|--help)  usage ;;
+  "")         usage >&2; exit 1 ;;
+  -*)         die "unknown option: $1 (try --help)" ;;
+  *)          # bare <file.html> [opts]; legacy `<file> --update ID` still works
+              [ -f "$1" ] || die "unknown command or file: $1 (commands: login doctor publish update list get content delete; try --help)"
+              parse_page_opts "$@"
+              if [ -n "$legacy_update" ]; then positional=("$legacy_update" "${positional[@]}"); do_update
+              else do_publish; fi ;;
+esac
